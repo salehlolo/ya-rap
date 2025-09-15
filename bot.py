@@ -209,10 +209,25 @@ class FuturesExchange:
             "password": password,
             "enableRateLimit": True,
             "timeout": 15000,
+            "options": {
+                "fetchCurrencies": False,
+            },
         })
+        try:
+            self.x.set_sandbox_mode(True)
+        except Exception:
+            pass
         self.x.headers = self.x.headers or {}
         self.x.headers["x-simulated-trading"] = "1"
-        self.x.load_markets()
+        try:
+            self.x.load_markets()
+        except Exception:
+            try:
+                if hasattr(self.x, "has") and isinstance(self.x.has, dict):
+                    self.x.has["fetchCurrencies"] = False
+            except Exception:
+                pass
+            self.x.load_markets()
         self.cfg = cfg
         self._universe_cache: Dict[str, any] = {"ts": 0.0, "symbols": []}
         self._health_cache: Dict[str, float] = {}
