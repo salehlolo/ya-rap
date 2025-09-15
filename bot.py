@@ -2,17 +2,17 @@
 # -*- coding: utf-8 -*-
 
 """
-bot.py — Triple+3 Strategies (Self-Evolving) Scalper — Binance USDM, Alerts-Only
+bot.py — Triple+3 Strategies (Self-Evolving) Scalper — OKX Demo Trading
 (نسخة بدون أي تكامل مع OpenAI — تداول/إشعارات فقط)
 
-تعليمي فقط — لا ينفّذ أوامر تداول حقيقية (Paper Engine).
+تعليمي فقط — يعمل على حساب OKX التجريبي مع تنفيذ أوامر حقيقية على الديمو + Paper Engine.
 Env:
-  BINANCE_API_KEY, BINANCE_API_SECRET
+  OKX_API_KEY, OKX_SECRET_KEY, OKX_PASSPHRASE
   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
   (اختياري) CRYPTOPANIC_TOKEN, NEWSAPI_KEY  ← تقدر تسيبهم فاضيين
 """
 
-import os, time, json, argparse, datetime as dt, random, math
+import os, time, json, argparse, datetime as dt, random
 from dataclasses import dataclass, asdict
 from typing import Optional, Tuple, List, Dict, Callable
 
@@ -50,7 +50,6 @@ def clamp(v, lo, hi): return max(lo, min(hi, v))
 def safe_float(x, default=np.nan):
     try: return float(x)
     except Exception: return default
-def pct(n): return f"{n*100:.2f}%"
 
 # =========================
 # Config
@@ -126,8 +125,8 @@ class Config:
     news_keywords: Tuple[str, ...] = ("ETF","hack","exploit","ban","SEC","lawsuit","fork","upgrade","halving")
 
     # Universe
-    # ==== تعديل #1: تغيير العدد إلى 10 ====
-    top_n_symbols: int = 10
+    # ==== Universe Size: Top 20 على OKX ====
+    top_n_symbols: int = 20
     refresh_universe_minutes: int = 360
     health_refresh_minutes: int = 90
     health_test_limit: int = 50
@@ -160,9 +159,6 @@ class Config:
 
     # Committee Override: لازم أقل حاجة X نماذج تتفق على نفس الاتجاه
     committee_min_agree: int = 2
-
-    # Dynamic Cooldown (بالدقائق): خسارة 1→30، 2→60، 3+→180
-    cooldown_steps: Tuple[int, ...] = (30, 60, 180)
 
     # Daily Stop Loss: يوقف لباقي اليوم لو نزل -2% من رأس المال المرجعي
     daily_stop_enabled: bool = True
@@ -204,14 +200,18 @@ class Notifier:
 
 class FuturesExchange:
     def __init__(self, cfg: Config):
-        key = os.getenv("BINANCE_API_KEY")
-        secret = os.getenv("BINANCE_API_SECRET")
-        self.x = ccxt.binanceusdm({
-            "apiKey": key, "secret": secret,
-            "options": {"defaultType": "future"},
+        key = os.getenv("OKX_API_KEY")
+        secret = os.getenv("OKX_SECRET_KEY")
+        password = os.getenv("OKX_PASSPHRASE")
+        self.x = ccxt.okx({
+            "apiKey": key,
+            "secret": secret,
+            "password": password,
             "enableRateLimit": True,
-            "timeout": 15000
+            "timeout": 15000,
         })
+        self.x.headers = self.x.headers or {}
+        self.x.headers["x-simulated-trading"] = "1"
         self.x.load_markets()
         self.cfg = cfg
         self._universe_cache: Dict[str, any] = {"ts": 0.0, "symbols": []}
@@ -229,18 +229,51 @@ class FuturesExchange:
 
     def fetch_funding_rate(self, symbol: str) -> Optional[float]:
         try:
-            m = self.x.market(symbol)
-            fr = self.x.fapiPublic_get_premiumindex({"symbol": m["id"]})
-            return safe_float(fr.get("lastFundingRate", None), default=None)
+            fr = self.x.fetch_funding_rate(symbol)
+            if isinstance(fr, dict):
+                val = fr.get("fundingRate")
+                if val is None and hasattr(fr, "fundingRate"):
+                    val = getattr(fr, "fundingRate", None)
+                return safe_float(val, default=None)
+            return safe_float(fr, default=None)
         except Exception:
-            return None
+            try:
+                market = self.x.market(symbol)
+                method = getattr(self.x, "public_get_public_funding_rate", None)
+                if not method:
+                    method = getattr(self.x, "publicGetPublicFundingRate", None)
+                if not method:
+                    return None
+                data = method({"instId": market["id"]})
+                items = (data or {}).get("data") if isinstance(data, dict) else None
+                if items:
+                    rate = items[0].get("fundingRate")
+                    return safe_float(rate, default=None)
+            except Exception:
+                return None
+        return None
 
     def get_balance_usdt(self) -> float:
         try:
-            bal = self.x.fetch_balance(params={"type":"future"})
-            return float(bal["total"].get("USDT", 0.0))
+            bal = self.x.fetch_balance(params={"type": "swap"})
+            total = bal.get("total", {}) if isinstance(bal, dict) else {}
+            if isinstance(total, dict) and total.get("USDT") is not None:
+                return float(total.get("USDT", 0.0))
+            usdt = bal.get("USDT") if isinstance(bal, dict) else None
+            if isinstance(usdt, dict) and usdt.get("total") is not None:
+                return float(usdt.get("total", 0.0))
+            info = bal.get("info", {}) if isinstance(bal, dict) else {}
+            data = (info.get("data") or [{}]) if isinstance(info, dict) else [{}]
+            details = data[0].get("details") if isinstance(data[0], dict) else None
+            if isinstance(details, list):
+                for d in details:
+                    if d.get("ccy") == "USDT":
+                        eq = d.get("eq") or d.get("cashBal") or d.get("availEq")
+                        if eq is not None:
+                            return float(eq)
         except Exception:
             return 0.0
+        return 0.0
 
     def get_top_symbols(self, n: int = 50) -> List[str]:
         nowt = time.time()
@@ -257,12 +290,17 @@ class FuturesExchange:
                 t = tickers.get(sym, {})
                 qv = t.get("quoteVolume")
                 if qv is None:
-                    qv = float(t.get("info", {}).get("quoteVolume", 0) or 0)
-                top.append((sym, float(qv)))
+                    info = t.get("info", {}) if isinstance(t, dict) else {}
+                    qv = info.get("quoteVolume24h") or info.get("volCcy24h") or info.get("volUsd24h")
+                try:
+                    qv_float = float(qv)
+                except Exception:
+                    qv_float = 0.0
+                top.append((sym, qv_float))
             top.sort(key=lambda x: x[1], reverse=True)
-            syms = [s for s,_ in top[:n]] or ["BTC/USDT","ETH/USDT"]
+            syms = [s for s,_ in top[:n]] or ["BTC/USDT:USDT","ETH/USDT:USDT"]
         except Exception:
-            syms = ["BTC/USDT","ETH/USDT"]
+            syms = ["BTC/USDT:USDT","ETH/USDT:USDT"]
         self._universe_cache = {"ts": nowt, "symbols": syms}
         return syms
 
@@ -844,13 +882,33 @@ def in_quiet_window(cfg: Config) -> bool:
             return True
     return False
 
-def volatility_target_size(equity_usdt: float, atr_pct: float, price: float, cfg: Config) -> float:
-    if (atr_pct is None) or atr_pct <= 0 or price <= 0:
+def calc_order_amount_okx(ex: ccxt.Exchange, symbol: str, price: float, equity_usdt: float,
+                          leverage: float = 10.0) -> float:
+    """حساب حجم الصفقة على OKX بناءً على 85% من رأس المال مع رافعة معينة."""
+    if price <= 0 or equity_usdt <= 0:
         return 0.0
-    dollar_risk_unit = equity_usdt * cfg.risk_k
-    value = min(dollar_risk_unit / atr_pct, cfg.max_position_value_usd)
-    qty = value / price
-    return max(qty, 0.0)
+    target_notional = equity_usdt * 0.85 * leverage
+    if target_notional <= 0:
+        return 0.0
+    raw_amount = target_notional / price
+    try:
+        market = ex.market(symbol)
+    except Exception:
+        market = {}
+    limits = market.get("limits", {}) if isinstance(market, dict) else {}
+    amt_limits = limits.get("amount", {}) if isinstance(limits, dict) else {}
+    min_amt = safe_float(amt_limits.get("min"), default=0.0)
+    max_amt = safe_float(amt_limits.get("max"), default=0.0)
+    if min_amt and raw_amount < min_amt:
+        raw_amount = min_amt
+    if max_amt and raw_amount > max_amt:
+        raw_amount = max_amt
+    try:
+        precise = ex.amount_to_precision(symbol, raw_amount)
+        amount = float(precise)
+    except Exception:
+        amount = raw_amount
+    return max(amount, 0.0)
 
 # =========================
 # Bot
@@ -874,8 +932,6 @@ class Bot:
 
         # ==== إدارة المخاطر الإضافية (state) ====
         s = self.state.setdefault("risk", {})
-        s.setdefault("cooldown_until_ts", 0.0)   # وقت التهدئة حتى (UNIX ts)
-        s.setdefault("loss_streak", 0)           # خسائر متتالية
         s.setdefault("daily_date", now_utc().date().isoformat())
         s.setdefault("daily_pnl", 0.0)           # صافي اليوم
         s.setdefault("daily_stopped", False)     # تم تفعيل الوقف اليومي؟
@@ -893,27 +949,6 @@ class Bot:
         with open(self.cfg.state_json,"w",encoding="utf-8") as f: json.dump(self.state, f, ensure_ascii=False, indent=2)
 
     # ===== أدوات إدارة المخاطر الإضافية =====
-
-    def _cooldown_active(self) -> bool:
-        return time.time() < float(self.state.get("risk", {}).get("cooldown_until_ts", 0.0))
-
-    def _set_cooldown_after_loss(self):
-        r = self.state.setdefault("risk", {})
-        r["loss_streak"] = int(r.get("loss_streak", 0)) + 1
-        # اختر مدة التهدئة بناء على عدد الخسائر
-        idx = min(r["loss_streak"]-1, len(self.cfg.cooldown_steps)-1)
-        minutes = self.cfg.cooldown_steps[idx]
-        r["cooldown_until_ts"] = time.time() + minutes * 60
-        self._save_state()
-        self.notifier.send(f"⏳ Cooldown ON — خسائر متتالية: {r['loss_streak']} → إيقاف دخول صفقات لمدة {minutes} دقيقة")
-
-    def _reset_cooldown_on_win(self):
-        r = self.state.setdefault("risk", {})
-        if r.get("loss_streak", 0) > 0:
-            r["loss_streak"] = 0
-            r["cooldown_until_ts"] = 0.0
-            self._save_state()
-            self.notifier.send("✅ Cooldown RESET — تم تصفير الخسائر المتتالية")
 
     def _daily_rollover_if_needed(self):
         r = self.state.setdefault("risk", {})
@@ -953,6 +988,97 @@ class Bot:
             ("VWAP-R", sig_vwap_r),
             ("KSQ", sig_ksq),
         ]
+
+    def _ensure_leverage_cross(self, symbol: str, leverage: int = 10):
+        try:
+            if hasattr(self.ex.x, "set_margin_mode"):
+                self.ex.x.set_margin_mode("cross", symbol)
+            elif hasattr(self.ex.x, "setMarginMode"):
+                self.ex.x.setMarginMode("cross", symbol)
+        except Exception as e:
+            self.notifier.send(f"⚠️ Unable to set cross margin for {symbol}: {e}")
+        try:
+            if hasattr(self.ex.x, "set_leverage"):
+                self.ex.x.set_leverage(leverage, symbol)
+            elif hasattr(self.ex.x, "setLeverage"):
+                self.ex.x.setLeverage(leverage, symbol)
+        except Exception as e:
+            self.notifier.send(f"⚠️ Unable to set leverage {leverage}x for {symbol}: {e}")
+
+    def _place_exit_algo_orders(self, symbol: str, sig: Signal, amount: float) -> bool:
+        market = self.ex.x.market(symbol)
+        inst_id = market.get("id") if isinstance(market, dict) else None
+        if not inst_id:
+            return False
+        method = getattr(self.ex.x, "private_post_trade_order_algo", None)
+        if method is None:
+            method = getattr(self.ex.x, "privatePostTradeOrderAlgo", None)
+        if method is None:
+            return False
+        side_close = "sell" if sig.side == "buy" else "buy"
+        pos_side = "long" if sig.side == "buy" else "short"
+        try:
+            sz = self.ex.x.amount_to_precision(symbol, amount)
+        except Exception:
+            sz = amount
+        payload = {
+            "instId": inst_id,
+            "tdMode": "cross",
+            "side": side_close,
+            "posSide": pos_side,
+            "ordType": "conditional",
+            "sz": str(sz),
+            "tpTriggerPx": str(sig.tp),
+            "tpOrdPx": "-1",
+            "slTriggerPx": str(sig.sl),
+            "slOrdPx": "-1",
+            "tpTriggerPxType": "last",
+            "slTriggerPxType": "last",
+        }
+        try:
+            resp = method(payload)
+            if isinstance(resp, dict):
+                success = resp.get("code") == "0" or resp.get("data")
+                return bool(success)
+            return bool(resp)
+        except Exception as e:
+            self.notifier.send(f"⚠️ Failed to submit separate TP/SL orders for {symbol}: {e}")
+            return False
+
+    def _execute_market_order(self, symbol: str, sig: Signal, amount: float) -> Optional[dict]:
+        leverage = 10
+        self._ensure_leverage_cross(symbol, leverage)
+        base_params = {
+            "tdMode": "cross",
+            "reduceOnly": False,
+            "lever": str(leverage),
+            "posSide": "long" if sig.side == "buy" else "short",
+        }
+        params = dict(base_params)
+        params.update({
+            "takeProfitPrice": float(sig.tp),
+            "stopLossPrice": float(sig.sl),
+            "tpTriggerPx": str(sig.tp),
+            "tpOrdPx": "-1",
+            "slTriggerPx": str(sig.sl),
+            "slOrdPx": "-1",
+            "tpTriggerPxType": "last",
+            "slTriggerPxType": "last",
+        })
+        try:
+            return self.ex.x.create_order(symbol, "market", sig.side, amount, None, params)
+        except Exception as first_err:
+            self.notifier.send(f"⚠️ Inline TP/SL rejected for {symbol}: {first_err}")
+            try:
+                order = self.ex.x.create_order(symbol, "market", sig.side, amount, None, base_params)
+            except Exception as second_err:
+                self.notifier.send(f"❌ Order failed for {symbol}: {second_err}")
+                return None
+            if self._place_exit_algo_orders(symbol, sig, amount):
+                self.notifier.send(f"ℹ️ Placed separate TP/SL orders for {symbol} (algo)")
+            else:
+                self.notifier.send(f"⚠️ Separate TP/SL orders not confirmed for {symbol}. Manage exits manually.")
+            return order
 
     def _committee(self, symbol: str, row: pd.Series, regime: Regime) -> Optional[Signal]:
         """
@@ -1044,7 +1170,10 @@ class Bot:
         return best_sig if accept else None
 
     def run(self):
-        self.notifier.send(f"[START] Evolving Scalper | TOP {self.cfg.top_n_symbols} | TF {self.cfg.timeframe} | RefEq={self.ref_equity:.2f} USDT")
+        self.notifier.send(
+            f"[START] Evolving Scalper | OKX Demo | TOP {self.cfg.top_n_symbols}"
+            f" | TF {self.cfg.timeframe} | RefEq={self.ref_equity:.2f} USDT | Lev x10"
+        )
         while True:
             try:
                 self.loop_once()
@@ -1078,12 +1207,10 @@ class Bot:
 
                     # تحديث المخاطر (streak + daily pnl)
                     pnl_sum = 0.0
-                    sl_count = 0
                     for t in closed:
                         key = f"{t.symbol}|{ctx}|{t.model}"
                         self.bandit.update(key, t.result)
                         pnl_sum += float(t.pnl_usd or 0.0)
-                        if t.result == "sl": sl_count += 1
                         emoji = "✅" if t.result=="tp" else "❌"
                         hold_s = int((pd.to_datetime(t.exit_time)-pd.to_datetime(t.timestamp)).total_seconds())
                         self.notifier.send(
@@ -1099,12 +1226,6 @@ class Bot:
                     self._save_state()
                     # وقّف يومي لو تعدى الحد
                     self._check_and_apply_daily_stop()
-                    # إدارة الستريك/التهدئة
-                    if sl_count > 0:
-                        self._set_cooldown_after_loss()
-                    else:
-                        self._reset_cooldown_on_win()
-
                     self.bandit.decay_weights(0.998)
                     self._save_state()
             except Exception:
@@ -1114,8 +1235,8 @@ class Bot:
         if len(self.paper.open) > 0:
             return
 
-        # لا تدخل صفقات جديدة لو في تهدئة أو وقف يومي
-        if self._cooldown_active() or self._daily_stop_active():
+        # لا تدخل صفقات جديدة لو في وقف يومي
+        if self._daily_stop_active():
             return
 
         # هدوء أحداث أو ثروتل
@@ -1150,28 +1271,43 @@ class Bot:
                     if (now_utc() - self.last_time[symbol]).total_seconds()/60.0 < self.cfg.min_minutes_between_same_signal:
                         continue
 
-                qty_ref = volatility_target_size(self.ref_equity, float(row["atr_pct"]), price, self.cfg)
-                notional_ref = qty_ref * price
                 risk = abs(price - sig.sl); reward = abs(sig.tp - price)
                 rr = round(reward / risk, 2) if risk > 0 else None
 
-                msg = (
-                    f"📢 [EVOLVE-COMMITTEE - {sig.model}] New Signal\n\n"
-                    f"📍 Pair: {symbol}\n"
-                    f"🕒 TF: {self.cfg.timeframe} | Ctx: trend={regime.trend}, vol={regime.vol_bucket}\n"
-                    f"📈 Side: {sig.side.upper()} | Conf: {sig.confidence:.2f}\n\n"
-                    f"💰 Entry: {price:.4f}\n"
-                    f"🎯 TP: {sig.tp:.4f} ({'+' if sig.tp > price else ''}{pct((sig.tp-price)/price)})\n"
-                    f"🛡 SL: {sig.sl:.4f} ({'-' if sig.sl < price else '+'}{pct(abs(sig.sl-price)/price)})\n"
-                    f"📏 R:R = {rr if rr is not None else 'n/a'}\n\n"
-                    f"🧠 Why: {sig.reason}\n"
-                    f"📦 SizeRef: ~{qty_ref:.6f} ({notional_ref:.2f} USDT)\n"
-                    f"⚠️ Alert Only – No Auto Execution"
+                equity_now = self.ex.get_balance_usdt() or self.ref_equity
+                if equity_now and equity_now > 0:
+                    self.ref_equity = equity_now
+                sizing_equity = equity_now if equity_now and equity_now > 0 else self.ref_equity
+                order_amount = calc_order_amount_okx(self.ex.x, symbol, price, sizing_equity, leverage=10.0)
+                if order_amount <= 0:
+                    self.notifier.send(f"⚠️ Skipping {symbol}: unable to size order (equity≈{sizing_equity:.2f} USDT)")
+                    continue
+
+                order = self._execute_market_order(symbol, sig, order_amount)
+                if not order:
+                    continue
+
+                order_id = None
+                if isinstance(order, dict):
+                    order_id = order.get("id") or order.get("orderId")
+                    if not order_id:
+                        info = order.get("info", {})
+                        if isinstance(info, dict):
+                            order_id = info.get("ordId") or info.get("orderId")
+
+                executed_notional = order_amount * price
+                exec_msg = (
+                    f"✅ EXECUTED {sig.side.upper()} {symbol} @ MARKET\n"
+                    f"• Model: {sig.model} | Conf: {sig.confidence:.2f}\n"
+                    f"• Qty: {order_amount:.6f} (~{executed_notional:.2f} USDT)\n"
+                    f"• TP: {sig.tp:.4f} | SL: {sig.sl:.4f} | R:R = {rr if rr is not None else 'n/a'}\n"
+                    f"• Reason: {sig.reason}\n"
+                    f"• OrderID: {order_id or 'n/a'}"
                 )
-                self.notifier.send(msg)
+                self.notifier.send(exec_msg)
                 self.last_alert_ts = time.time()
 
-                self.paper.log_signal(symbol, row, sig, qty_ref, notional_ref, rr, self.cfg, regime)
+                self.paper.log_signal(symbol, row, sig, order_amount, executed_notional, rr, self.cfg, regime)
                 t = self.paper.open_virtual(symbol, price, sig, self.cfg)
                 self.paper.ml_snapshot(t.id, symbol, row, regime)
 
@@ -1188,7 +1324,7 @@ class Bot:
 # =========================
 
 def parse_args() -> Config:
-    p = argparse.ArgumentParser(description="Evolving Committee Scalper (Alerts Only) — No OpenAI")
+    p = argparse.ArgumentParser(description="Evolving Committee Scalper — OKX Demo Auto Trader (No OpenAI)")
     p.add_argument("--timeframe", default="5m")
     p.add_argument("--quiet", nargs="*", default=None, help="UTC HH:MM times to avoid (e.g., 12:30 18:00)")
     p.add_argument("--top", type=int, default=None, help="Top N USDT perpetuals to scan (override config)")
@@ -1210,7 +1346,11 @@ def parse_args() -> Config:
 
 def main():
     cfg = parse_args()
-    print("Config:\n", json.dumps(asdict(cfg), indent=2, default=str))
+    cfg_view = asdict(cfg)
+    for secret_key in ("telegram_token", "telegram_chat_id"):
+        if cfg_view.get(secret_key):
+            cfg_view[secret_key] = "***"
+    print("Config:\n", json.dumps(cfg_view, indent=2, default=str))
     bot = Bot(cfg)
     bot.run()
 
