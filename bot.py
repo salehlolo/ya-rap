@@ -279,6 +279,43 @@ class FuturesExchange:
             print(f"[WARN] Failed to place TP/SL algo order for {symbol}: {exc}")
             return None
 
+    def has_any_open_position(self) -> bool:
+        """Return True when any swap position or open order exists."""
+        try:
+            positions = self.x.fetch_positions(params={"instType": "SWAP"})
+            if isinstance(positions, list):
+                for pos in positions:
+                    if not isinstance(pos, dict):
+                        continue
+                    for key in ("contracts", "positionAmt", "size", "amount"):
+                        val = pos.get(key)
+                        if val in (None, "0", 0):
+                            continue
+                        try:
+                            if abs(float(val)) > 0.0:
+                                return True
+                        except Exception:
+                            continue
+                    info = pos.get("info") if isinstance(pos, dict) else {}
+                    if isinstance(info, dict):
+                        for key in ("pos", "posCcy", "availPos"):
+                            val = info.get(key)
+                            if val in (None, "0", 0):
+                                continue
+                            try:
+                                if abs(float(val)) > 0.0:
+                                    return True
+                            except Exception:
+                                continue
+        except Exception:
+            pass
+
+        try:
+            opens = self.x.fetch_open_orders()
+            return bool(opens)
+        except Exception:
+            return False
+
 
 # ---------------------------------------------------------------------------
 # Grid-like strategy (translated from Pine Script)
@@ -374,6 +411,7 @@ class Bot:
         self.timeframe = getattr(cfg, "timeframe", "5m")
         self.leverage = int(getattr(cfg, "leverage", 10))
         self.poll_interval = float(getattr(cfg, "poll_interval", 20.0))
+        self.single_global = bool(getattr(cfg, "single_global_position", True))
 
         self.contexts: Dict[str, Dict[str, Any]] = {}
         top_n = getattr(cfg, "top_n", None)
@@ -398,6 +436,18 @@ class Bot:
                 "last_ts": None,
                 "active_trade": None,
             }
+
+    def _has_any_open_trade(self) -> bool:
+        for ctx in self.contexts.values():
+            if ctx.get("active_trade"):
+                return True
+        if hasattr(self.ex, "has_any_open_position"):
+            try:
+                if self.ex.has_any_open_position():
+                    return True
+            except Exception:
+                pass
+        return False
 
     def run(self) -> None:
         symbols = ", ".join(self.symbols)
@@ -440,6 +490,11 @@ class Bot:
         result = ctx["strategy"].update(close_f)
         signal = result.get("signal")
         if signal and ctx["active_trade"] is None:
+            if self.single_global and self._has_any_open_trade():
+                self.notifier.send(
+                    "⛔ Signal ignored: an open position already exists (single-position mode)"
+                )
+                return
             self._execute_trade(symbol, ctx, close_f, result)
 
     def _evaluate_trade_exit(
@@ -645,6 +700,8 @@ def build_config(args: argparse.Namespace) -> SimpleNamespace:
         cfg.top_n = 10
     if not hasattr(cfg, "alloc_pct"):
         cfg.alloc_pct = 0.90
+    if not hasattr(cfg, "single_global_position"):
+        cfg.single_global_position = True
 
     if args.timeframe:
         cfg.timeframe = args.timeframe
