@@ -136,6 +136,91 @@ class FuturesExchange:
         except Exception:
             pass
 
+    def get_top_symbols(self, n: int = 10) -> List[str]:
+        markets = getattr(self.x, "markets", {}) or {}
+        try:
+            tickers = self.x.fetch_tickers()
+        except Exception:
+            tickers = {}
+
+        rows: List[tuple[float, str]] = []
+        for sym, market in markets.items():
+            try:
+                if not market.get("swap"):
+                    continue
+                if market.get("quote") != "USDT":
+                    continue
+                if market.get("active") is False:
+                    continue
+
+                ticker = tickers.get(sym, {}) or {}
+                qv = ticker.get("quoteVolume")
+                if qv is None:
+                    info = ticker.get("info", {}) if isinstance(ticker, dict) else {}
+                    qv = (
+                        info.get("volCcy24h")
+                        or info.get("volUsd24h")
+                        or info.get("vol24h")
+                    )
+                qv_f = safe_float(qv, 0.0) or 0.0
+                rows.append((qv_f, sym))
+            except Exception:
+                continue
+
+        rows.sort(key=lambda item: item[0], reverse=True)
+        limit = max(1, int(n))
+        top = [sym for _, sym in rows[:limit]]
+        if not top:
+            top = ["BTC/USDT:USDT", "ETH/USDT:USDT"]
+        return top
+
+    def fetch_equity_usdt(self) -> float:
+        try:
+            balance = self.x.fetch_balance()
+        except Exception:
+            return 0.0
+
+        usdt = balance.get("USDT") if isinstance(balance, dict) else None
+        if isinstance(usdt, dict):
+            for key in ("free", "total"):
+                val = usdt.get(key)
+                if val is not None:
+                    result = safe_float(val, 0.0)
+                    if result is not None:
+                        return result
+
+        for section in ("free", "total"):
+            bucket = balance.get(section) if isinstance(balance, dict) else None
+            if isinstance(bucket, dict):
+                val = bucket.get("USDT")
+                if val is not None:
+                    result = safe_float(val, 0.0)
+                    if result is not None:
+                        return result
+        return 0.0
+
+    def clamp_amount_to_limits(self, symbol: str, amount: float) -> float:
+        try:
+            market = self.x.market(symbol)
+        except Exception:
+            market = {}
+
+        limits = (market.get("limits") or {}).get("amount") if isinstance(market, dict) else None
+        min_amt = safe_float((limits or {}).get("min"), None) if isinstance(limits, dict) else None
+        max_amt = safe_float((limits or {}).get("max"), None) if isinstance(limits, dict) else None
+
+        adj = float(amount)
+        if min_amt is not None:
+            adj = max(adj, min_amt)
+        if max_amt is not None:
+            adj = min(adj, max_amt)
+
+        try:
+            adj = float(self.x.amount_to_precision(symbol, adj))
+        except Exception:
+            adj = float(adj)
+        return adj
+
     def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int = 2) -> List[List[float]]:
         return self.x.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
 
@@ -286,12 +371,25 @@ class Bot:
         self.notifier = Notifier(cfg)
         self.ex = FuturesExchange(cfg)
 
-        self.timeframe = getattr(cfg, "timeframe", "1m")
+        self.timeframe = getattr(cfg, "timeframe", "5m")
         self.leverage = int(getattr(cfg, "leverage", 10))
         self.poll_interval = float(getattr(cfg, "poll_interval", 20.0))
 
         self.contexts: Dict[str, Dict[str, Any]] = {}
-        for symbol in cfg.symbols:
+        top_n = getattr(cfg, "top_n", None)
+        if top_n is None:
+            top_n = getattr(cfg, "top_n_symbols", 10)
+        try:
+            symbols = self.ex.get_top_symbols(int(top_n))
+        except Exception:
+            symbols = list(getattr(cfg, "symbols", ["BTC/USDT:USDT"]))
+        if not symbols:
+            symbols = ["BTC/USDT:USDT"]
+
+        self.symbols = list(symbols)
+        cfg.symbols = list(symbols)
+
+        for symbol in self.symbols:
             strategy = GridLikeStrategy(
                 cfg.grid_point, cfg.grid_order_size, cfg.grid_mf, cfg.grid_anti
             )
@@ -302,7 +400,7 @@ class Bot:
             }
 
     def run(self) -> None:
-        symbols = ", ".join(self.contexts.keys())
+        symbols = ", ".join(self.symbols)
         self.notifier.send(
             f"[START] Grid Like Strategy | OKX Demo | TF {self.timeframe} | Symbols: {symbols}"
         )
@@ -396,16 +494,39 @@ class Bot:
     def _execute_trade(
         self, symbol: str, ctx: Dict[str, Any], close_price: float, result: Dict[str, Any]
     ) -> None:
-        size_val = safe_float(result.get("size"), 0.0)
         tp = safe_float(result.get("tp"))
         sl = safe_float(result.get("sl"))
-        if size_val is None or size_val <= 0 or tp is None or sl is None:
+        if tp is None or sl is None:
             return
 
-        amount = self.ex.normalize_amount(symbol, size_val)
+        price = safe_float(close_price)
+        if price is None or price <= 0:
+            self.notifier.send(
+                f"⚠️ Skipping {symbol}: invalid price for sizing ({close_price})"
+            )
+            return
+
+        equity = float(self.ex.fetch_equity_usdt())
+        alloc_pct = float(getattr(self.cfg, "alloc_pct", 0.90))
+        notional = max(0.0, equity * alloc_pct * float(self.leverage))
+        if notional <= 0.0:
+            self.notifier.send(
+                f"⚠️ Skipping {symbol}: equity={equity:.4f} not sufficient for trade"
+            )
+            return
+
+        raw_amount = notional / price if price > 0 else 0.0
+        if raw_amount <= 0:
+            self.notifier.send(
+                f"⚠️ Skipping {symbol}: computed raw amount <= 0 ({raw_amount})"
+            )
+            return
+
+        amount = self.ex.normalize_amount(symbol, raw_amount)
+        amount = self.ex.clamp_amount_to_limits(symbol, amount)
         if amount <= 0:
             self.notifier.send(
-                f"⚠️ Skipping {symbol}: normalized amount is non-positive ({amount})"
+                f"⚠️ Skipping {symbol}: computed amount<=0 after limits ({amount})"
             )
             return
 
@@ -497,7 +618,7 @@ def build_config(args: argparse.Namespace) -> SimpleNamespace:
     cfg = _to_ns(raw_cfg)
 
     if not hasattr(cfg, "timeframe"):
-        cfg.timeframe = "1m"
+        cfg.timeframe = "5m"
     if not hasattr(cfg, "poll_interval"):
         cfg.poll_interval = 20.0
     if not hasattr(cfg, "telegram_token"):
@@ -520,6 +641,10 @@ def build_config(args: argparse.Namespace) -> SimpleNamespace:
         cfg.symbols = _ensure_symbols(cfg.symbols)
     if not hasattr(cfg, "leverage"):
         cfg.leverage = 10
+    if not hasattr(cfg, "top_n"):
+        cfg.top_n = 10
+    if not hasattr(cfg, "alloc_pct"):
+        cfg.alloc_pct = 0.90
 
     if args.timeframe:
         cfg.timeframe = args.timeframe
