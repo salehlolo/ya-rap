@@ -199,6 +199,75 @@ class FuturesExchange:
                         return result
         return 0.0
 
+    def fetch_free_usdt(self) -> float:
+        try:
+            balance = self.x.fetch_balance()
+        except Exception:
+            return 0.0
+
+        if isinstance(balance, dict):
+            usdt_bucket = balance.get("USDT")
+            if isinstance(usdt_bucket, dict):
+                val = usdt_bucket.get("free")
+                if val is not None:
+                    result = safe_float(val, 0.0)
+                    if result is not None:
+                        return result
+
+            free_section = balance.get("free")
+            if isinstance(free_section, dict):
+                val = free_section.get("USDT")
+                if val is not None:
+                    result = safe_float(val, 0.0)
+                    if result is not None:
+                        return result
+
+        return 0.0
+
+    def amount_round_down(self, symbol: str, amount: float) -> float:
+        try:
+            market = self.x.market(symbol)
+        except Exception:
+            market = {}
+
+        lot = None
+        if isinstance(market, dict):
+            info = market.get("info") or {}
+            try:
+                lot = safe_float(info.get("lotSz"), None)
+            except Exception:
+                lot = None
+
+        amt = float(amount)
+        if lot and lot > 0:
+            try:
+                steps = int(amt // lot)
+                amt = steps * lot
+            except Exception:
+                amt = amt - (amt % lot)
+
+        try:
+            amt = float(self.x.amount_to_precision(symbol, amt))
+        except Exception:
+            amt = float(amt)
+
+        return max(amt, 0.0)
+
+    def min_notional_usdt(self, symbol: str) -> float:
+        try:
+            market = self.x.market(symbol)
+        except Exception:
+            market = {}
+
+        info = market.get("info") if isinstance(market, dict) else None
+        if isinstance(info, dict):
+            val = info.get("minNotional")
+            result = safe_float(val, None)
+            if result is not None:
+                return result
+
+        return 10.0
+
     def clamp_amount_to_limits(self, symbol: str, amount: float) -> float:
         try:
             market = self.x.market(symbol)
@@ -437,6 +506,115 @@ class Bot:
                 "active_trade": None,
             }
 
+    def _get_price_tick(self, symbol: str) -> float:
+        try:
+            market = self.ex.x.market(symbol)
+        except Exception:
+            market = {}
+
+        tick = None
+        if isinstance(market, dict):
+            info = market.get("info") or {}
+            try:
+                tick_val = info.get("tickSz")
+                if tick_val is not None:
+                    tick = safe_float(tick_val, None)
+            except Exception:
+                tick = None
+
+        if tick is not None and tick > 0:
+            return tick
+
+        precision = None
+        if isinstance(market, dict):
+            precision = (market.get("precision") or {}).get("price")
+
+        try:
+            if precision is not None:
+                prec_int = int(precision)
+                if prec_int >= 0:
+                    return 10 ** (-prec_int)
+        except Exception:
+            pass
+
+        return 0.0001
+
+    def _adjust_triggers_for_okx(
+        self, symbol: str, side_open: str, tp: float, sl: float, last: float
+    ) -> tuple[float, float]:
+        tick = max(self._get_price_tick(symbol), 1e-10)
+
+        try:
+            last_f = float(last)
+        except Exception:
+            last_f = None
+
+        if last_f is None or last_f <= 0:
+            return float(tp), float(sl)
+
+        tp_f = float(tp)
+        sl_f = float(sl)
+
+        if side_open == "buy":
+            tp_f = max(tp_f, last_f + tick)
+            sl_f = min(sl_f, last_f - tick)
+        else:
+            tp_f = min(tp_f, last_f - tick)
+            sl_f = max(sl_f, last_f + tick)
+
+        try:
+            tp_f = float(self.ex.x.price_to_precision(symbol, tp_f))
+        except Exception:
+            tp_f = float(tp_f)
+
+        try:
+            sl_f = float(self.ex.x.price_to_precision(symbol, sl_f))
+        except Exception:
+            sl_f = float(sl_f)
+
+        if side_open == "buy":
+            if not (tp_f > last_f):
+                tp_f = float(last_f + 2 * tick)
+                try:
+                    tp_f = float(self.ex.x.price_to_precision(symbol, tp_f))
+                except Exception:
+                    pass
+            if not (sl_f < last_f):
+                sl_f = float(last_f - 2 * tick)
+                try:
+                    sl_f = float(self.ex.x.price_to_precision(symbol, sl_f))
+                except Exception:
+                    pass
+            if sl_f <= 0:
+                sl_candidate = last_f - tick
+                if sl_candidate <= 0:
+                    sl_candidate = max(last_f * 0.5, tick)
+                try:
+                    sl_f = float(self.ex.x.price_to_precision(symbol, sl_candidate))
+                except Exception:
+                    sl_f = float(sl_candidate)
+        else:
+            if not (tp_f < last_f):
+                tp_f = float(last_f - 2 * tick)
+                try:
+                    tp_f = float(self.ex.x.price_to_precision(symbol, tp_f))
+                except Exception:
+                    pass
+            if not (sl_f > last_f):
+                sl_f = float(last_f + 2 * tick)
+                try:
+                    sl_f = float(self.ex.x.price_to_precision(symbol, sl_f))
+                except Exception:
+                    pass
+            if sl_f <= 0:
+                sl_candidate = last_f + tick
+                try:
+                    sl_f = float(self.ex.x.price_to_precision(symbol, sl_candidate))
+                except Exception:
+                    sl_f = float(sl_candidate)
+
+        return tp_f, sl_f
+
     def _has_any_open_trade(self) -> bool:
         for ctx in self.contexts.values():
             if ctx.get("active_trade"):
@@ -554,44 +732,58 @@ class Bot:
         if tp is None or sl is None:
             return
 
-        price = safe_float(close_price)
-        if price is None or price <= 0:
+        side_val = result.get("signal")
+        if side_val not in ("buy", "sell"):
+            return
+        side = str(side_val)
+
+        try:
+            ticker = self.ex.x.fetch_ticker(symbol)
+        except Exception:
+            ticker = {}
+
+        last_price = safe_float((ticker or {}).get("last"))
+        price_ref = safe_float(close_price)
+        if last_price is None or last_price <= 0:
+            last_price = price_ref
+        if last_price is None or last_price <= 0:
             self.notifier.send(
-                f"⚠️ Skipping {symbol}: invalid price for sizing ({close_price})"
+                f"⚠️ Skipping {symbol}: unable to determine valid market price"
             )
             return
 
-        equity = float(self.ex.fetch_equity_usdt())
+        free_usdt = float(self.ex.fetch_free_usdt())
         alloc_pct = float(getattr(self.cfg, "alloc_pct", 0.90))
-        notional = max(0.0, equity * alloc_pct * float(self.leverage))
-        if notional <= 0.0:
-            self.notifier.send(
-                f"⚠️ Skipping {symbol}: equity={equity:.4f} not sufficient for trade"
-            )
+        lev = float(self.leverage)
+        target_notional = free_usdt * alloc_pct * lev
+        if target_notional <= 0:
+            self.notifier.send(f"⚠️ Skipping {symbol}: no free USDT for allocation")
             return
 
-        raw_amount = notional / price if price > 0 else 0.0
-        if raw_amount <= 0:
-            self.notifier.send(
-                f"⚠️ Skipping {symbol}: computed raw amount <= 0 ({raw_amount})"
-            )
-            return
-
-        amount = self.ex.normalize_amount(symbol, raw_amount)
-        amount = self.ex.clamp_amount_to_limits(symbol, amount)
+        raw_amount = target_notional / last_price if last_price > 0 else 0.0
+        amount = self.ex.amount_round_down(symbol, raw_amount)
         if amount <= 0:
             self.notifier.send(
-                f"⚠️ Skipping {symbol}: computed amount<=0 after limits ({amount})"
+                f"⚠️ Skipping {symbol}: computed amount <= 0 after rounding"
+            )
+            return
+
+        min_notional = self.ex.min_notional_usdt(symbol)
+        actual_notional = amount * last_price
+        if actual_notional < min_notional:
+            self.notifier.send(
+                f"⚠️ Skipping {symbol}: 90% notional ({actual_notional:.2f} USDT) < min {min_notional:.2f} USDT."
             )
             return
 
         self.ex.ensure_cross_leverage(symbol, self.leverage)
-        order = self.ex.create_market_order(symbol, str(result.get("signal")), amount)
+        order = self.ex.create_market_order(symbol, side, amount)
         if not order:
             self.notifier.send(f"❌ Order failed for {symbol}")
             return
 
-        exit_resp = self.ex.place_exit_algo(symbol, str(result.get("signal")), amount, tp, sl)
+        tp_adj, sl_adj = self._adjust_triggers_for_okx(symbol, side, tp, sl, last_price)
+        exit_resp = self.ex.place_exit_algo(symbol, side, amount, tp_adj, sl_adj)
         if exit_resp is None:
             self.notifier.send(
                 f"⚠️ Unable to confirm TP/SL algo order for {symbol}. Manage exits manually."
@@ -608,20 +800,20 @@ class Bot:
                     order_id = info.get("ordId") or info.get("orderId")
 
         ctx["active_trade"] = {
-            "side": str(result.get("signal")),
+            "side": side,
             "size": amount,
-            "tp": tp,
-            "sl": sl,
-            "entry_price": close_price,
+            "tp": tp_adj,
+            "sl": sl_adj,
+            "entry_price": last_price,
             "entry_time": time.time(),
             "order_id": order_id,
         }
 
         message = (
-            f"✅ EXECUTED {str(result.get('signal')).upper()} {symbol} @ MARKET\n"
+            f"✅ EXECUTED {side.upper()} {symbol} @ MARKET\n"
             f"• Qty: {amount:.6f}\n"
-            f"• Entry: {close_price:.4f}\n"
-            f"• TP: {tp:.4f} | SL: {sl:.4f}\n"
+            f"• Entry: {last_price:.4f}\n"
+            f"• TP: {tp_adj:.4f} | SL: {sl_adj:.4f}\n"
             f"• OrderID: {order_id or 'n/a'}"
         )
         self.notifier.send(message)
