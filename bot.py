@@ -380,9 +380,32 @@ class Bot:
         self.symbols = list(symbols)
         cfg.symbols = list(symbols)
 
+        os_map = getattr(cfg, "grid_order_size_map", {}) or {}
+        if not isinstance(os_map, dict):
+            os_map = {}
         for symbol in self.symbols:
+            base_os = os_map.get(symbol, cfg.grid_order_size)
+            try:
+                base_os = float(base_os)
+            except Exception:
+                base_os = float(cfg.grid_order_size)
+
+            if base_os <= 0:
+                base_os = float(cfg.grid_order_size)
+
+            try:
+                market = self.ex.x.market(symbol)
+                if isinstance(market, dict):
+                    limits = market.get("limits") or {}
+                    amount_limits = limits.get("amount") or {}
+                    min_amt = safe_float(amount_limits.get("min"))
+                    if min_amt is not None and min_amt > 0 and base_os < min_amt:
+                        base_os = min_amt
+            except Exception:
+                pass
+
             strategy = GridLikeStrategy(
-                cfg.grid_point, cfg.grid_order_size, cfg.grid_mf, cfg.grid_anti
+                cfg.grid_point, base_os, cfg.grid_mf, cfg.grid_anti
             )
             self.contexts[symbol] = {
                 "strategy": strategy,
@@ -784,7 +807,24 @@ def build_config(args: argparse.Namespace) -> SimpleNamespace:
     if not hasattr(cfg, "grid_point"):
         cfg.grid_point = 2.0
     if not hasattr(cfg, "grid_order_size"):
-        cfg.grid_order_size = 1.0
+        cfg.grid_order_size = 0.01
+    if not hasattr(cfg, "grid_order_size_map"):
+        cfg.grid_order_size_map = {}
+    else:
+        map_val = cfg.grid_order_size_map
+        if isinstance(map_val, str):
+            try:
+                map_val = json.loads(map_val)
+            except Exception:
+                map_val = {}
+        if isinstance(map_val, dict):
+            cfg.grid_order_size_map = {
+                str(key): float(val)
+                for key, val in map_val.items()
+                if val is not None
+            }
+        else:
+            cfg.grid_order_size_map = {}
     if not hasattr(cfg, "grid_mf"):
         cfg.grid_mf = 2.0
     if not hasattr(cfg, "grid_anti"):
