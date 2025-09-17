@@ -174,131 +174,8 @@ class FuturesExchange:
             top = ["BTC/USDT:USDT", "ETH/USDT:USDT"]
         return top
 
-    def fetch_equity_usdt(self) -> float:
-        try:
-            balance = self.x.fetch_balance()
-        except Exception:
-            return 0.0
-
-        usdt = balance.get("USDT") if isinstance(balance, dict) else None
-        if isinstance(usdt, dict):
-            for key in ("free", "total"):
-                val = usdt.get(key)
-                if val is not None:
-                    result = safe_float(val, 0.0)
-                    if result is not None:
-                        return result
-
-        for section in ("free", "total"):
-            bucket = balance.get(section) if isinstance(balance, dict) else None
-            if isinstance(bucket, dict):
-                val = bucket.get("USDT")
-                if val is not None:
-                    result = safe_float(val, 0.0)
-                    if result is not None:
-                        return result
-        return 0.0
-
-    def fetch_free_usdt(self) -> float:
-        try:
-            balance = self.x.fetch_balance()
-        except Exception:
-            return 0.0
-
-        if isinstance(balance, dict):
-            usdt_bucket = balance.get("USDT")
-            if isinstance(usdt_bucket, dict):
-                val = usdt_bucket.get("free")
-                if val is not None:
-                    result = safe_float(val, 0.0)
-                    if result is not None:
-                        return result
-
-            free_section = balance.get("free")
-            if isinstance(free_section, dict):
-                val = free_section.get("USDT")
-                if val is not None:
-                    result = safe_float(val, 0.0)
-                    if result is not None:
-                        return result
-
-        return 0.0
-
-    def amount_round_down(self, symbol: str, amount: float) -> float:
-        try:
-            market = self.x.market(symbol)
-        except Exception:
-            market = {}
-
-        lot = None
-        if isinstance(market, dict):
-            info = market.get("info") or {}
-            try:
-                lot = safe_float(info.get("lotSz"), None)
-            except Exception:
-                lot = None
-
-        amt = float(amount)
-        if lot and lot > 0:
-            try:
-                steps = int(amt // lot)
-                amt = steps * lot
-            except Exception:
-                amt = amt - (amt % lot)
-
-        try:
-            amt = float(self.x.amount_to_precision(symbol, amt))
-        except Exception:
-            amt = float(amt)
-
-        return max(amt, 0.0)
-
-    def min_notional_usdt(self, symbol: str) -> float:
-        try:
-            market = self.x.market(symbol)
-        except Exception:
-            market = {}
-
-        info = market.get("info") if isinstance(market, dict) else None
-        if isinstance(info, dict):
-            val = info.get("minNotional")
-            result = safe_float(val, None)
-            if result is not None:
-                return result
-
-        return 10.0
-
-    def clamp_amount_to_limits(self, symbol: str, amount: float) -> float:
-        try:
-            market = self.x.market(symbol)
-        except Exception:
-            market = {}
-
-        limits = (market.get("limits") or {}).get("amount") if isinstance(market, dict) else None
-        min_amt = safe_float((limits or {}).get("min"), None) if isinstance(limits, dict) else None
-        max_amt = safe_float((limits or {}).get("max"), None) if isinstance(limits, dict) else None
-
-        adj = float(amount)
-        if min_amt is not None:
-            adj = max(adj, min_amt)
-        if max_amt is not None:
-            adj = min(adj, max_amt)
-
-        try:
-            adj = float(self.x.amount_to_precision(symbol, adj))
-        except Exception:
-            adj = float(adj)
-        return adj
-
     def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int = 2) -> List[List[float]]:
         return self.x.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-
-    def normalize_amount(self, symbol: str, amount: float) -> float:
-        try:
-            prec = self.x.amount_to_precision(symbol, amount)
-            return float(prec)
-        except Exception:
-            return float(amount)
 
     def create_market_order(
         self, symbol: str, side: str, amount: float
@@ -311,7 +188,14 @@ class FuturesExchange:
             return None
 
     def place_exit_algo(
-        self, symbol: str, side: str, amount: float, tp: float, sl: float
+        self,
+        symbol: str,
+        side: str,
+        amount: float,
+        tp: float,
+        sl: float,
+        tp_type: str = "last",
+        sl_type: str = "last",
     ) -> Optional[Dict[str, Any]]:
         market = self.x.market(symbol)
         inst_id = market.get("id") if isinstance(market, dict) else None
@@ -337,8 +221,8 @@ class FuturesExchange:
             "tpOrdPx": "-1",
             "slTriggerPx": str(sl),
             "slOrdPx": "-1",
-            "tpTriggerPxType": "last",
-            "slTriggerPxType": "last",
+            "tpTriggerPxType": tp_type,
+            "slTriggerPxType": sl_type,
         }
 
         try:
@@ -506,7 +390,7 @@ class Bot:
                 "active_trade": None,
             }
 
-    def _get_price_tick(self, symbol: str) -> float:
+    def _price_tick(self, symbol: str) -> float:
         try:
             market = self.ex.x.market(symbol)
         except Exception:
@@ -539,81 +423,24 @@ class Bot:
 
         return 0.0001
 
-    def _adjust_triggers_for_okx(
-        self, symbol: str, side_open: str, tp: float, sl: float, last: float
-    ) -> tuple[float, float]:
-        tick = max(self._get_price_tick(symbol), 1e-10)
+    def _guard_tp_sl(
+        self, symbol: str, side_open: str, tp: float, sl: float, last_price: Optional[float]
+    ) -> tuple[float, float, str, str]:
+        if last_price is None or last_price <= 0:
+            return float(tp), float(sl), "last", "last"
 
-        try:
-            last_f = float(last)
-        except Exception:
-            last_f = None
-
-        if last_f is None or last_f <= 0:
-            return float(tp), float(sl)
-
+        tick = max(self._price_tick(symbol), 1e-9)
         tp_f = float(tp)
         sl_f = float(sl)
 
         if side_open == "buy":
-            tp_f = max(tp_f, last_f + tick)
-            sl_f = min(sl_f, last_f - tick)
+            tp_f = max(tp_f, last_price + tick)
+            sl_f = min(sl_f, last_price - tick)
         else:
-            tp_f = min(tp_f, last_f - tick)
-            sl_f = max(sl_f, last_f + tick)
+            tp_f = min(tp_f, last_price - tick)
+            sl_f = max(sl_f, last_price + tick)
 
-        try:
-            tp_f = float(self.ex.x.price_to_precision(symbol, tp_f))
-        except Exception:
-            tp_f = float(tp_f)
-
-        try:
-            sl_f = float(self.ex.x.price_to_precision(symbol, sl_f))
-        except Exception:
-            sl_f = float(sl_f)
-
-        if side_open == "buy":
-            if not (tp_f > last_f):
-                tp_f = float(last_f + 2 * tick)
-                try:
-                    tp_f = float(self.ex.x.price_to_precision(symbol, tp_f))
-                except Exception:
-                    pass
-            if not (sl_f < last_f):
-                sl_f = float(last_f - 2 * tick)
-                try:
-                    sl_f = float(self.ex.x.price_to_precision(symbol, sl_f))
-                except Exception:
-                    pass
-            if sl_f <= 0:
-                sl_candidate = last_f - tick
-                if sl_candidate <= 0:
-                    sl_candidate = max(last_f * 0.5, tick)
-                try:
-                    sl_f = float(self.ex.x.price_to_precision(symbol, sl_candidate))
-                except Exception:
-                    sl_f = float(sl_candidate)
-        else:
-            if not (tp_f < last_f):
-                tp_f = float(last_f - 2 * tick)
-                try:
-                    tp_f = float(self.ex.x.price_to_precision(symbol, tp_f))
-                except Exception:
-                    pass
-            if not (sl_f > last_f):
-                sl_f = float(last_f + 2 * tick)
-                try:
-                    sl_f = float(self.ex.x.price_to_precision(symbol, sl_f))
-                except Exception:
-                    pass
-            if sl_f <= 0:
-                sl_candidate = last_f + tick
-                try:
-                    sl_f = float(self.ex.x.price_to_precision(symbol, sl_candidate))
-                except Exception:
-                    sl_f = float(sl_candidate)
-
-        return tp_f, sl_f
+        return tp_f, sl_f, "last", "last"
 
     def _has_any_open_trade(self) -> bool:
         for ctx in self.contexts.values():
@@ -752,28 +579,36 @@ class Bot:
             )
             return
 
-        free_usdt = float(self.ex.fetch_free_usdt())
-        alloc_pct = float(getattr(self.cfg, "alloc_pct", 0.90))
-        lev = float(self.leverage)
-        target_notional = free_usdt * alloc_pct * lev
-        if target_notional <= 0:
-            self.notifier.send(f"⚠️ Skipping {symbol}: no free USDT for allocation")
+        raw_amount = safe_float(result.get("size"))
+        if raw_amount is None:
             return
 
-        raw_amount = target_notional / last_price if last_price > 0 else 0.0
-        amount = self.ex.amount_round_down(symbol, raw_amount)
+        try:
+            amount = float(self.ex.x.amount_to_precision(symbol, raw_amount))
+        except Exception:
+            amount = float(raw_amount)
+
+        try:
+            market = self.ex.x.market(symbol)
+        except Exception:
+            market = {}
+
+        limits = (market.get("limits") or {}).get("amount") if isinstance(market, dict) else None
+        min_amt = safe_float((limits or {}).get("min"), None) if isinstance(limits, dict) else None
+        max_amt = safe_float((limits or {}).get("max"), None) if isinstance(limits, dict) else None
+
+        if min_amt is not None and amount < min_amt:
+            amount = float(min_amt)
+        if max_amt is not None and amount > max_amt:
+            amount = float(max_amt)
+
+        try:
+            amount = float(self.ex.x.amount_to_precision(symbol, amount))
+        except Exception:
+            amount = float(amount)
+
         if amount <= 0:
-            self.notifier.send(
-                f"⚠️ Skipping {symbol}: computed amount <= 0 after rounding"
-            )
-            return
-
-        min_notional = self.ex.min_notional_usdt(symbol)
-        actual_notional = amount * last_price
-        if actual_notional < min_notional:
-            self.notifier.send(
-                f"⚠️ Skipping {symbol}: 90% notional ({actual_notional:.2f} USDT) < min {min_notional:.2f} USDT."
-            )
+            self.notifier.send(f"⚠️ Skipping {symbol}: amount<=0 after limits.")
             return
 
         self.ex.ensure_cross_leverage(symbol, self.leverage)
@@ -782,8 +617,80 @@ class Bot:
             self.notifier.send(f"❌ Order failed for {symbol}")
             return
 
-        tp_adj, sl_adj = self._adjust_triggers_for_okx(symbol, side, tp, sl, last_price)
-        exit_resp = self.ex.place_exit_algo(symbol, side, amount, tp_adj, sl_adj)
+        tp_adj, sl_adj, tp_type, sl_type = self._guard_tp_sl(
+            symbol, side, tp, sl, last_price
+        )
+
+        try:
+            tp_adj = float(self.ex.x.price_to_precision(symbol, tp_adj))
+        except Exception:
+            tp_adj = float(tp_adj)
+
+        try:
+            sl_adj = float(self.ex.x.price_to_precision(symbol, sl_adj))
+        except Exception:
+            sl_adj = float(sl_adj)
+
+        tick = max(self._price_tick(symbol), 1e-9)
+        if last_price is not None:
+            if side == "buy":
+                attempts = 0
+                while not (tp_adj > last_price) and attempts < 5:
+                    tp_adj = float(last_price + (attempts + 1) * tick)
+                    try:
+                        tp_adj = float(self.ex.x.price_to_precision(symbol, tp_adj))
+                    except Exception:
+                        tp_adj = float(tp_adj)
+                    attempts += 1
+
+                attempts = 0
+                while not (sl_adj < last_price) and attempts < 5:
+                    candidate = last_price - (attempts + 1) * tick
+                    if candidate <= 0:
+                        break
+                    sl_adj = float(candidate)
+                    try:
+                        sl_adj = float(self.ex.x.price_to_precision(symbol, sl_adj))
+                    except Exception:
+                        sl_adj = float(sl_adj)
+                    attempts += 1
+
+                if not (tp_adj > last_price) or not (sl_adj < last_price) or sl_adj <= 0:
+                    self.notifier.send(
+                        f"⚠️ Skipping {symbol}: unable to guard TP/SL relative to last price"
+                    )
+                    return
+            else:
+                attempts = 0
+                while not (tp_adj < last_price) and attempts < 5:
+                    candidate = last_price - (attempts + 1) * tick
+                    if candidate <= 0:
+                        break
+                    tp_adj = float(candidate)
+                    try:
+                        tp_adj = float(self.ex.x.price_to_precision(symbol, tp_adj))
+                    except Exception:
+                        tp_adj = float(tp_adj)
+                    attempts += 1
+
+                attempts = 0
+                while not (sl_adj > last_price) and attempts < 5:
+                    sl_adj = float(last_price + (attempts + 1) * tick)
+                    try:
+                        sl_adj = float(self.ex.x.price_to_precision(symbol, sl_adj))
+                    except Exception:
+                        sl_adj = float(sl_adj)
+                    attempts += 1
+
+                if not (tp_adj < last_price) or not (sl_adj > last_price):
+                    self.notifier.send(
+                        f"⚠️ Skipping {symbol}: unable to guard TP/SL relative to last price"
+                    )
+                    return
+
+        exit_resp = self.ex.place_exit_algo(
+            symbol, side, amount, tp_adj, sl_adj, tp_type, sl_type
+        )
         if exit_resp is None:
             self.notifier.send(
                 f"⚠️ Unable to confirm TP/SL algo order for {symbol}. Manage exits manually."
@@ -890,10 +797,8 @@ def build_config(args: argparse.Namespace) -> SimpleNamespace:
         cfg.leverage = 10
     if not hasattr(cfg, "top_n"):
         cfg.top_n = 10
-    if not hasattr(cfg, "alloc_pct"):
-        cfg.alloc_pct = 0.90
     if not hasattr(cfg, "single_global_position"):
-        cfg.single_global_position = True
+        cfg.single_global_position = False
 
     if args.timeframe:
         cfg.timeframe = args.timeframe
