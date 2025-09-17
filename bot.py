@@ -228,6 +228,39 @@ class FuturesExchange:
             except Exception:
                 pass
             self.x.load_markets()
+        # === Detect/force position mode (NET vs Hedged) ===
+        self.is_hedged = False
+        forced_mode = False
+        try:
+            if hasattr(self.x, "set_position_mode"):
+                self.x.set_position_mode(False)
+                forced_mode = True
+                self.is_hedged = False
+        except Exception:
+            forced_mode = False
+            try:
+                get_cfg = (getattr(self.x, "private_get_account_config", None)
+                           or getattr(self.x, "privateGetAccountConfig", None))
+                if get_cfg:
+                    cfg = get_cfg()
+                    data = (cfg.get("data") or [{}]) if isinstance(cfg, dict) else [{}]
+                    first = data[0] if data else {}
+                    mode = first.get("posMode") if isinstance(first, dict) else None
+                    self.is_hedged = (mode == "long_short_mode")
+            except Exception:
+                pass
+        if not forced_mode and not self.is_hedged:
+            try:
+                get_cfg = (getattr(self.x, "private_get_account_config", None)
+                           or getattr(self.x, "privateGetAccountConfig", None))
+                if get_cfg:
+                    cfg = get_cfg()
+                    data = (cfg.get("data") or [{}]) if isinstance(cfg, dict) else [{}]
+                    first = data[0] if data else {}
+                    mode = first.get("posMode") if isinstance(first, dict) else None
+                    self.is_hedged = (mode == "long_short_mode")
+            except Exception:
+                pass
         self.cfg = cfg
         self._universe_cache: Dict[str, any] = {"ts": 0.0, "symbols": []}
         self._health_cache: Dict[str, float] = {}
@@ -1006,32 +1039,38 @@ class Bot:
 
     def _ensure_leverage_cross(self, symbol: str, leverage: int = 10):
         try:
-            if hasattr(self.ex.x, "set_margin_mode"):
-                self.ex.x.set_margin_mode("cross", symbol)
-            elif hasattr(self.ex.x, "setMarginMode"):
-                self.ex.x.setMarginMode("cross", symbol)
-        except Exception as e:
-            self.notifier.send(f"⚠️ Unable to set cross margin for {symbol}: {e}")
+            hedged = bool(getattr(self.ex, "is_hedged", False))
+        except Exception:
+            hedged = False
+        setter = getattr(self.ex.x, "set_leverage", None) or getattr(self.ex.x, "setLeverage", None)
+        if setter is None:
+            self.notifier.send(f"⚠️ Unable to set leverage/cross for {symbol}: method not available")
+            return
         try:
-            if hasattr(self.ex.x, "set_leverage"):
-                self.ex.x.set_leverage(leverage, symbol)
-            elif hasattr(self.ex.x, "setLeverage"):
-                self.ex.x.setLeverage(leverage, symbol)
+            if hedged:
+                setter(leverage, symbol, {"mgnMode": "cross", "posSide": "long"})
+                setter(leverage, symbol, {"mgnMode": "cross", "posSide": "short"})
+            else:
+                setter(leverage, symbol, {"mgnMode": "cross"})
         except Exception as e:
-            self.notifier.send(f"⚠️ Unable to set leverage {leverage}x for {symbol}: {e}")
+            self.notifier.send(f"⚠️ Unable to set leverage/cross for {symbol}: {e}")
 
     def _place_exit_algo_orders(self, symbol: str, sig: Signal, amount: float) -> bool:
         market = self.ex.x.market(symbol)
         inst_id = market.get("id") if isinstance(market, dict) else None
         if not inst_id:
             return False
-        method = getattr(self.ex.x, "private_post_trade_order_algo", None)
-        if method is None:
-            method = getattr(self.ex.x, "privatePostTradeOrderAlgo", None)
+        method = getattr(self.ex.x, "private_post_trade_order_algo", None) or getattr(
+            self.ex.x, "privatePostTradeOrderAlgo", None
+        )
         if method is None:
             return False
         side_close = "sell" if sig.side == "buy" else "buy"
         pos_side = "long" if sig.side == "buy" else "short"
+        try:
+            hedged = bool(getattr(self.ex, "is_hedged", False))
+        except Exception:
+            hedged = False
         try:
             sz = self.ex.x.amount_to_precision(symbol, amount)
         except Exception:
@@ -1040,7 +1079,6 @@ class Bot:
             "instId": inst_id,
             "tdMode": "cross",
             "side": side_close,
-            "posSide": pos_side,
             "ordType": "conditional",
             "sz": str(sz),
             "tpTriggerPx": str(sig.tp),
@@ -1050,11 +1088,12 @@ class Bot:
             "tpTriggerPxType": "last",
             "slTriggerPxType": "last",
         }
+        if hedged:
+            payload["posSide"] = pos_side
         try:
             resp = method(payload)
             if isinstance(resp, dict):
-                success = resp.get("code") == "0" or resp.get("data")
-                return bool(success)
+                return bool(resp.get("code") == "0" or resp.get("data"))
             return bool(resp)
         except Exception as e:
             self.notifier.send(f"⚠️ Failed to submit separate TP/SL orders for {symbol}: {e}")
@@ -1063,37 +1102,22 @@ class Bot:
     def _execute_market_order(self, symbol: str, sig: Signal, amount: float) -> Optional[dict]:
         leverage = 10
         self._ensure_leverage_cross(symbol, leverage)
-        base_params = {
-            "tdMode": "cross",
-            "reduceOnly": False,
-            "lever": str(leverage),
-            "posSide": "long" if sig.side == "buy" else "short",
-        }
-        params = dict(base_params)
-        params.update({
-            "takeProfitPrice": float(sig.tp),
-            "stopLossPrice": float(sig.sl),
-            "tpTriggerPx": str(sig.tp),
-            "tpOrdPx": "-1",
-            "slTriggerPx": str(sig.sl),
-            "slOrdPx": "-1",
-            "tpTriggerPxType": "last",
-            "slTriggerPxType": "last",
-        })
+        params = {"tdMode": "cross"}
         try:
-            return self.ex.x.create_order(symbol, "market", sig.side, amount, None, params)
-        except Exception as first_err:
-            self.notifier.send(f"⚠️ Inline TP/SL rejected for {symbol}: {first_err}")
-            try:
-                order = self.ex.x.create_order(symbol, "market", sig.side, amount, None, base_params)
-            except Exception as second_err:
-                self.notifier.send(f"❌ Order failed for {symbol}: {second_err}")
-                return None
-            if self._place_exit_algo_orders(symbol, sig, amount):
-                self.notifier.send(f"ℹ️ Placed separate TP/SL orders for {symbol} (algo)")
-            else:
-                self.notifier.send(f"⚠️ Separate TP/SL orders not confirmed for {symbol}. Manage exits manually.")
-            return order
+            if bool(getattr(self.ex, "is_hedged", False)):
+                params["posSide"] = "long" if sig.side == "buy" else "short"
+        except Exception:
+            pass
+        try:
+            order = self.ex.x.create_order(symbol, "market", sig.side, amount, None, params)
+        except Exception as e:
+            self.notifier.send(f"❌ Order failed for {symbol}: {e}")
+            return None
+        if self._place_exit_algo_orders(symbol, sig, amount):
+            self.notifier.send(f"ℹ️ Placed separate TP/SL orders for {symbol} (algo)")
+        else:
+            self.notifier.send(f"⚠️ Separate TP/SL orders not confirmed for {symbol}. Manage exits manually.")
+        return order
 
     def _committee(self, symbol: str, row: pd.Series, regime: Regime) -> Optional[Signal]:
         """
